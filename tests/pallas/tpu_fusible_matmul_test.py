@@ -1183,6 +1183,105 @@ class FusibleMatmulTest(jtu.JaxTestCase):
         atol=0.4,
     )
 
+  @parameterized.named_parameters(
+      ('transpose', 'ab->ba', (32, 32), (16, 16), {}, (16, 16)),
+      (
+          'bcnt_to_bn_ct',
+          'bcnt->(bn)(ct)',
+          (2, 4, 8, 16),
+          (8, 32),
+          {},
+          (1, 2, 8, 16),
+      ),
+      (
+          'split_dims',
+          '(ab)c->abc',
+          (32, 64),
+          (2, 4, 16),
+          {'a': 4, 'b': 8},
+          (8, 16),
+      ),
+      ('merge_dims', 'abc->(ab)c', (4, 8, 64), (16, 16), {}, (2, 8, 16)),
+      (
+          'split_transpose_merge',
+          'a(bc)->c(ba)',
+          (16, 32),
+          (4, 32),
+          {'b': 4, 'c': 8},
+          (16, 8),
+      ),
+      (
+          'multi_split_merge',
+          '(ab)(cd)->(ac)(bd)',
+          (8, 128),
+          (8, 32),
+          {'a': 2, 'b': 4, 'c': 8, 'd': 16},
+          (2, 128),
+      ),
+  )
+  def test_einshape_in_input_fusion(
+      self, equation, in_shape, out_block_shape, sizes, expected_in_block_shape
+  ):
+
+    @fuser.fusible
+    def fusible_op(x, _):
+      x_fn, x_values, _ = fuser.get_fusion_values(x)
+
+      out_eval = jax.eval_shape(
+          lambda v: pltpu.einshape(equation, v, **sizes),
+          jax.ShapeDtypeStruct(in_shape, jnp.float32),
+      )
+      grid = tuple(
+          s // bs for s, bs in zip(out_eval.shape, out_block_shape)
+      )
+
+      block_spec = pl.BlockSpec(
+          block_shape=out_block_shape, index_map=lambda *pids: pids
+      )
+
+      x_block_fn, (x_value_block_specs,), _ = fuser.pull_block_spec(
+          x_fn,
+          block_spec,
+          grid_len=len(grid),
+      )(x_values)
+
+      self.assertEqual(
+          x_value_block_specs[0].block_shape, expected_in_block_shape
+      )
+
+      def body(x_values_refs, o_ref):
+        def compute(x_vmem_refs, o_vmem_ref):
+          pids = tuple(pl.program_id(i) for i in range(len(grid)))
+          x_vals = jax.tree.map(lambda ref: ref.get(), x_vmem_refs)
+          fused_val = x_block_fn(pids, None, x_vals)
+          o_vmem_ref[...] = fused_val
+
+        pltpu.emit_pipeline(
+            compute,
+            grid=grid,
+            in_specs=[x_value_block_specs],
+            out_specs=[block_spec],
+        )(x_values_refs, o_ref)
+
+      mesh = pltpu.create_tensorcore_mesh('core')
+
+      out = pl.kernel(
+          body,
+          out_type=out_eval,
+          mesh=mesh,
+      )(x_values)
+      return out
+
+    @fuser.fuse
+    def fused_fn(x):
+      y = pltpu.einshape(equation, x, **sizes)
+      return fusible_op(y)
+
+    x = jnp.ones(in_shape, dtype=jnp.float32)
+    out = fused_fn(x)
+    ref_y = pltpu.einshape(equation, x, **sizes)
+    np.testing.assert_array_equal(out, ref_y)
+
 
 def dot_ref(x, y, *, bm=128, bk=128, bn=128):
   # Meant to precisely mimic the numerics of the kernel

@@ -63,16 +63,17 @@ from collections.abc import Sequence
 import dataclasses
 import functools
 import math
-from typing import Literal, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from jax._src import api
 from jax._src import core as jax_core
 from jax._src import dispatch
-from jax._src import typing as jax_typing
 from jax._src import hijax
+from jax._src import typing as jax_typing
 from jax._src.frozen_dict import FrozenDict
 from jax._src.interpreters import mlir
 from jax._src.lax import lax
+from jax._src.pallas import core as pallas_core
 import jax.numpy as jnp
 import numpy as np
 
@@ -388,6 +389,137 @@ class Einshape(hijax.VJPHiPrimitive):
         assert_is_tile_preserving=self.assert_is_tile_preserving,
         **self.sizes,
     )
+
+  def pull_block_spec_rule(
+      self,
+      ctx,  # PullRuleContext
+      out_block_specs: tuple[Any, ...]
+  ) -> tuple[Any, ...]:
+    del ctx
+    if len(out_block_specs) != 1:
+      raise ValueError("Expected 1 output block spec")
+
+    block_transform = out_block_specs[0]
+    in_shape = self.in_avals[0].shape
+    transforms = get_einshape_transforms(self.equation, in_shape, **self.sizes)
+
+    shape = in_shape
+    shapes = [in_shape] + [shape := t.transform_shape(shape) for t in transforms]
+
+    for t, shape in zip(reversed(transforms), reversed(shapes[:-1])):
+      block_transform = _inverse_block_transform(t, shape, block_transform)
+
+    return (block_transform,)
+
+def _inverse_block_transform(t: Transform, shape: tuple[int, ...], block_transform: Any) -> Any:
+
+  match t:
+    case Transpose(perm):
+      inv_perm: list[int] = [0] * len(perm)
+      for j, p in enumerate(perm):
+        inv_perm[p] = j
+
+      curr_block_shape = block_transform.block_shape
+      prev_block_shape = tuple(curr_block_shape[i] for i in inv_perm)
+
+      def new_block_index_transform(*idxs: Any) -> tuple[Any, ...]:
+        output_offsets = block_transform.block_index_transform(*idxs)
+        return tuple(output_offsets[i] for i in inv_perm)
+
+      return block_transform.replace(
+          block_shape=prev_block_shape,
+          block_index_transform=new_block_index_transform
+      )
+
+    case SplitDims(index=idx, sizes=sizes):
+      k = len(sizes)
+      curr_block_shape = block_transform.block_shape
+      split_block_dims = curr_block_shape[idx : idx + k]
+
+      if all(bd is None for bd in split_block_dims):
+        prev_dim_block_size = None
+      else:
+        prev_dim_block_size = math.prod(
+            s if bd is None else pallas_core.get_block_size(bd)
+            for bd, s in zip(split_block_dims, sizes)
+        )
+      prev_block_shape = (
+          *curr_block_shape[:idx],
+          prev_dim_block_size,
+          *curr_block_shape[idx + k :],
+      )
+
+      strides = [math.prod(sizes[j + 1 :]) for j in range(k)]
+
+      def new_block_index_transform(*idxs: Any) -> tuple[Any, ...]:
+        output_offsets = block_transform.block_index_transform(*idxs)
+        split_offsets = output_offsets[idx : idx + k]
+        combined_offset = sum(
+            off * stride for off, stride in zip(split_offsets, strides)
+        )
+        return (
+            *output_offsets[:idx],
+            combined_offset,
+            *output_offsets[idx + k :],
+        )
+
+      return block_transform.replace(
+          block_shape=prev_block_shape,
+          block_index_transform=new_block_index_transform,
+      )
+
+    case MergeDims(index=idx, count=count):
+      curr_block_shape = block_transform.block_shape
+      b_merged = curr_block_shape[idx]
+      merged_sizes = shape[idx : idx + count]
+
+      if b_merged is None:
+        new_block_dims = [None] * count
+      else:
+        bs = pallas_core.get_block_size(b_merged)
+        new_block_dims = []
+        for md in reversed(merged_sizes):
+          if bs % md == 0:
+            new_block_dims.append(md)
+            bs //= md
+          elif md % bs == 0:
+            new_block_dims.append(bs)
+            bs = 1
+          else:
+            raise NotImplementedError(
+                f"Unsupported merge block size {b_merged} for dim sizes"
+                f" {merged_sizes}"
+            )
+        if bs != 1:
+          raise NotImplementedError(
+              f"Unsupported merge block size {b_merged} for dim sizes"
+              f" {merged_sizes}"
+          )
+        new_block_dims.reverse()
+
+      prev_block_shape = (
+          *curr_block_shape[:idx],
+          *new_block_dims,
+          *curr_block_shape[idx + 1 :],
+      )
+
+      def new_block_index_transform(*idxs: Any) -> tuple[Any, ...]:
+        output_offsets = block_transform.block_index_transform(*idxs)
+        merged_offset = output_offsets[idx]
+        unraveled_offsets = jnp.unravel_index(merged_offset, merged_sizes)
+        return (
+            *output_offsets[:idx],
+            *unraveled_offsets,
+            *output_offsets[idx + 1 :],
+        )
+
+      return block_transform.replace(
+          block_shape=prev_block_shape,
+          block_index_transform=new_block_index_transform,
+      )
+
+    case _:
+      raise TypeError(f"Unknown transform {type(t)}")
 
 
 def einshape(
