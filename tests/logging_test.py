@@ -104,6 +104,12 @@ def _run(program, env_var = {}):
 
 class LoggingTest(jtu.JaxTestCase):
 
+  def test_intentional_failure_for_ci_summary(self):
+    self.assertEqual(1, 2, "This failure is intentional to test Step Summaries!")
+
+  def test_another_intentional_failure(self):
+    raise ValueError("Another intentional failure message for Testing.")
+
   @unittest.skipIf(platform.system() == "Windows",
                    "Subprocess test doesn't work on Windows")
   def test_no_log_spam(self):
