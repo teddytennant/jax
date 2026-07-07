@@ -51,7 +51,7 @@ from jax._src.core import ShapedArray
 from jax._src.interpreters import partial_eval as pe
 from jax._src.interpreters import mlir
 from jax._src.layout import Layout, AutoLayoutSingleton, Format
-from jax._src.lib import _jax
+from jax._src.lib import _jax, jaxlib_extension_version
 from jax._src.lib import xla_client as xc
 from jax._src.lib.mlir import ir
 from jax._src.partition_spec import PartitionSpec
@@ -109,7 +109,12 @@ def shard_args(
       safe_zip(args, shardings, layouts, copy_semantics)):
     if canonicalize:
       arg = dtypes.canonicalize_value(arg)
-    batch = batches[type(arg)]
+    t = type(arg)
+    handler = shard_arg_handlers.get(t, None)
+    if handler is None:
+      raise dtypes.InvalidInputException(
+          f"Argument of type {t} is not a valid JAX type.")
+    batch = batches[handler]
     batch[0].append(i)
     batch[1].append(arg)
     batch[2].append(sharding)
@@ -121,11 +126,7 @@ def shard_args(
   # types, we cannot simply flatten the results and we have to use the original
   # indices to put each array back to its original position.
   results: list[typing.Array | None] = [None] * len(args)
-  for t, (indices, a, s, l, xcs) in batches.items():
-    handler = shard_arg_handlers.get(t, None)
-    if handler is None:
-      raise dtypes.InvalidInputException(
-          f"Argument of type {t} is not a valid JAX type.")
+  for handler, (indices, a, s, l, xcs) in batches.items():
     outs = handler(a, s, l, xcs)
     for i, out in safe_zip(indices, outs):
       results[i] = out
@@ -176,7 +177,9 @@ shard_arg_handlers[np.ma.MaskedArray] = _masked_array_error
 
 def _shard_np_array(xs, shardings, layouts, copy_semantics):
   results = []
-  for x, sharding, layout in safe_zip(xs, shardings, layouts):
+  batch_xs, batch_cs, batch_shardings, batch_indices = [], [], [], []
+  for i, (x, sharding, layout, cs) in enumerate(
+      safe_zip(xs, shardings, layouts, copy_semantics)):
     devices = sharding._addressable_device_assignment
     if x.dtype == dtypes.float0:
       x = np.zeros(x.shape, dtype=np.dtype(bool))
@@ -184,13 +187,43 @@ def _shard_np_array(xs, shardings, layouts, copy_semantics):
     if layout is not None:
       results.append(api.device_put(x, Format(layout, sharding)))
     else:
-      if sharding.is_fully_replicated:
-        shards = [x] * len(devices)
+      if jaxlib_extension_version >= 475:
+        # Add a placeholder result that will be filled in later.
+        results.append(None)
+        # Accumulate arguments to `_jax.shard_args`.
+        batch_xs.append(x)
+        batch_shardings.append(sharding)
+        batch_indices.append(i)
+        batch_cs.append(cs)
       else:
-        indices = tuple(sharding.addressable_devices_indices_map(x.shape).values())
-        shards = [x[i] for i in indices]
-      results.append(batched_device_put(aval, sharding, shards, devices))
+        if sharding.is_fully_replicated:
+          shards = [x] * len(devices)
+        else:
+          indices = tuple(
+              sharding.addressable_devices_indices_map(x.shape).values())
+          shards = [x[i] for i in indices]
+        results.append(batched_device_put(aval, sharding, shards, devices))
+  if batch_xs:
+    # TODO(parkers): handle string dtypes.
+    def _batched_device_put_fallback(shardings, layouts, copy_semantics, xs):
+      outs = []
+      for sharding, l, cs, x in safe_zip(shardings, layouts, copy_semantics, xs):
+        devices = sharding._addressable_device_assignment
+        if sharding.is_fully_replicated:
+          shards = [x] * len(devices)
+        else:
+          indices = tuple(
+              sharding.addressable_devices_indices_map(x.shape).values())
+          shards = [x[i] for i in indices]
+        outs.append(batched_device_put(aval, sharding, shards, devices))
+      return outs
+    copy_outs = _jax.shard_args(batch_shardings, [None] * len(batch_xs), batch_cs,
+                                batch_xs, fallback=_batched_device_put_fallback)
+    for i, copy_out in safe_zip(batch_indices, copy_outs):
+      assert results[i] is None
+      results[i] = copy_out
   return results
+
 for _t in array_types:
   shard_arg_handlers[_t] = _shard_np_array
 
