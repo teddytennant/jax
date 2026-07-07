@@ -141,6 +141,9 @@ def _check_tree(func_name, expected_name, actual_tree, expected_tree, has_aux=Fa
 def _prune_zeros(ts):
   return [t for t in ts if type(t) is not ad_util.Zero]
 
+def _prune_zeros_ft(ts):
+  nzs = [type(t) is not ad_util.Zero for t in ts]
+  return ts.map2(nzs, lambda t, nz: t if nz else None).filter_with_mask(nzs)
 
 def _make_closed_jaxpr(
     traceable,
