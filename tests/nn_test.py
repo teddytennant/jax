@@ -131,6 +131,38 @@ class NNFunctionsTest(jtu.JaxTestCase):
         out, out_ref.astype(dtype), rtol=1e-3, atol=1e-3
     )
 
+  def testScaledMatmulCpu(self):
+    # Test scaled_matmul on CPU with float32
+    batch, lhs_non_contract, contract, rhs_non_contract = 2, 4, 8, 5
+    k_a, k_b = 2, 2
+
+    k1, k2, k3, k4 = jax.random.split(jax.random.key(0), 4)
+    a = jax.random.normal(
+        k1, (batch, lhs_non_contract, contract), dtype=jnp.float32
+    )
+    b = jax.random.normal(
+        k2, (batch, rhs_non_contract, contract), dtype=jnp.float32
+    )
+    a_scales = jax.random.uniform(
+        k3, (batch, lhs_non_contract, k_a), dtype=jnp.float32
+    )
+    b_scales = jax.random.uniform(
+        k4, (batch, rhs_non_contract, k_b), dtype=jnp.float32
+    )
+
+    out = nn.scaled_matmul(
+        a, b, a_scales, b_scales, preferred_element_type=jnp.float32
+    )
+
+    # Reference implementation
+    a_block_size = contract // k_a
+    b_block_size = contract // k_b
+    a_scaled = a * jnp.repeat(a_scales, a_block_size, axis=-1)
+    b_scaled = b * jnp.repeat(b_scales, b_block_size, axis=-1)
+    out_ref = jnp.einsum("BMK,BNK->BMN", a_scaled, b_scaled)
+
+    self.assertArraysAllClose(out, out_ref, rtol=1e-5, atol=1e-5)
+
   @parameterized.product(
       is_training=[True, False],
       output_type=[jnp.float16, jnp.bfloat16, jnp.float32],
