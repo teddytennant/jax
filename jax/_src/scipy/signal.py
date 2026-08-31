@@ -104,17 +104,41 @@ def fftconvolve(in1: ArrayLike, in2: ArrayLike, mode: ModeString = "full",
     raise ValueError("in1 and in2 should have the same dimensionality")
   if mode not in ["same", "full", "valid"]:
     raise ValueError("mode must be one of ['same', 'full', 'valid']")
+  if in1.size == 0 or in2.size == 0:
+    # Nothing to convolve. SciPy returns a 1D empty array whatever the input
+    # rank, rather than an array of the full shape computed from a zero.
+    return jnp.zeros((0,), dtype=in1.dtype)
   _fftconvolve = partial(_fftconvolve_unbatched, mode=mode)
   if axes is None:
     return _fftconvolve(in1, in2)
   axes = _ensure_index_tuple(axes)
   axes = tuple(canonicalize_axis(ax, in1.ndim) for ax in axes)
-  mapped_axes = set(range(in1.ndim)) - set(axes)
-  if any(in1.shape[i] != in2.shape[i] for i in mapped_axes):
+  mapped_axes = sorted(set(range(in1.ndim)) - set(axes))
+  # A size-1 mapped axis broadcasts against the other input, as it does in
+  # scipy.signal._signaltools._init_freq_conv_axes.
+  if any(in1.shape[i] != in2.shape[i]
+         and 1 not in (in1.shape[i], in2.shape[i]) for i in mapped_axes):
     raise ValueError(f"mapped axes must have same shape; got {in1.shape=} {in2.shape=} {axes=}")
-  for ax in sorted(mapped_axes):
+  shape1 = in1.shape
+  if any(in1.shape[i] != in2.shape[i] for i in mapped_axes):
+    def broadcast(x):
+      shape = list(x.shape)
+      for i in mapped_axes:
+        shape[i] = max(in1.shape[i], in2.shape[i])
+      return jnp.broadcast_to(x, shape)
+    in1, in2 = broadcast(in1), broadcast(in2)
+  for ax in mapped_axes:
     _fftconvolve = api.vmap(_fftconvolve, in_axes=ax, out_axes=ax)
-  return _fftconvolve(in1, in2)
+  out = _fftconvolve(in1, in2)
+  if mode == 'same' and out.shape != shape1:
+    # 'same' returns in1's shape, and scipy applies that to a broadcast mapped
+    # axis too, taking the centered slice.
+    starts = [(out.shape[i] - shape1[i]) // 2 if i in mapped_axes else 0
+              for i in range(out.ndim)]
+    sizes = [shape1[i] if i in mapped_axes else out.shape[i]
+             for i in range(out.ndim)]
+    out = lax.dynamic_slice(out, starts, sizes)
+  return out
 
 def _fftconvolve_unbatched(in1: Array, in2: Array, mode: str) -> Array:
   full_shape = tuple(s1 + s2 - 1 for s1, s2 in zip(in1.shape, in2.shape))
@@ -171,7 +195,22 @@ def _convolve_nd(in1: Array, in2: Array, mode: ModeString, *, precision: Precisi
   no_swap = all(s1 >= s2 for s1, s2 in zip(in1.shape, in2.shape))
   swap = all(s1 <= s2 for s1, s2 in zip(in1.shape, in2.shape))
   if not (no_swap or swap):
-    raise ValueError("One input must be smaller than the other in every dimension.")
+    if mode == 'valid':
+      raise ValueError("For 'valid' mode, one input must be at least as large "
+                       "as the other in every dimension.")
+    # The kernel below needs one input to contain the other. Neither does, so
+    # pad the first up to the elementwise maximum: trailing zeros contribute
+    # nothing to the full convolution, they only extend its tail, which we then
+    # trim back to the true full shape.
+    full_shape = tuple(s1 + s2 - 1 for s1, s2 in zip(in1.shape, in2.shape))
+    padded = jnp.pad(in1, [(0, max(s2 - s1, 0))
+                           for s1, s2 in zip(in1.shape, in2.shape)])
+    full = _convolve_nd(padded, in2, 'full', precision=precision)
+    full = lax.slice(full, (0,) * full.ndim, full_shape)
+    if mode == 'full':
+      return full
+    start = tuple((f - s) // 2 for f, s in zip(full_shape, in1.shape))
+    return lax.dynamic_slice(full, start, in1.shape)
 
   shape_o = in2.shape
   if swap:
@@ -652,6 +691,9 @@ def _spectral_helper(x: Array, y: ArrayLike | None, fs: ArrayLike = 1.0,
         f"must be one of: {list(boundary_funcs.keys())}")
 
   axis = core.concrete_or_error(operator.index, axis, "axis of windowed-FFT")
+  # The callable-detrend wrapper below keys off the axis as the caller wrote
+  # it, not its canonical form, so keep the original around.
+  detrend_axis = axis
   axis = canonicalize_axis(axis, x.ndim)
 
   if y is None:
@@ -752,13 +794,13 @@ def _spectral_helper(x: Array, y: ArrayLike | None, fs: ArrayLike = 1.0,
   if isinstance(detrend_type, str):
     detrend_func = partial(detrend, type=detrend_type, axis=-1)
   elif callable(detrend_type):
-    if axis != -1:
+    if detrend_axis != -1:
       # Wrap this function so that it receives a shape that it could
       # reasonably expect to receive.
       def detrend_func(d):
-        d = jnp.moveaxis(d, axis, -1)
+        d = jnp.moveaxis(d, -1, detrend_axis)
         d = detrend_type(d)
-        return jnp.moveaxis(d, -1, axis)
+        return jnp.moveaxis(d, detrend_axis, -1)
     else:
       detrend_func = detrend_type
   elif not detrend_type:

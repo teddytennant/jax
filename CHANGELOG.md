@@ -46,6 +46,17 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
     fabricating a phantom slice for fully-empty inputs.
 
 * Bug fixes
+  * Fixed a callable `detrend` argument to {func}`jax.scipy.signal.welch`,
+    {func}`jax.scipy.signal.csd` and {func}`jax.scipy.signal.stft`, which was
+    applied across segments rather than along them.
+  * {func}`jax.scipy.signal.convolve`, {func}`jax.scipy.signal.correlate`,
+    {func}`jax.scipy.signal.convolve2d` and
+    {func}`jax.scipy.signal.correlate2d` now accept inputs where neither shape
+    is elementwise larger than the other in `full` and `same` modes, as SciPy
+    does. The restriction still applies to `valid` mode.
+  * {func}`jax.scipy.signal.fftconvolve` now returns an empty array for an
+    empty input rather than an array of zeros, and allows a size-1 axis to
+    broadcast against the other input when `axes` is passed.
   * Fixed a bug where {func}`jax.numpy.linalg.cond` returned NaN instead of
     infinity for singular matrices when `p` is `None` or `2`, matching NumPy
     and the other norms.

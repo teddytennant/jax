@@ -33,6 +33,9 @@ jax.config.parse_flags_with_absl()
 onedim_shapes = [(1,), (2,), (5,), (10,)]
 twodim_shapes = [(1, 1), (2, 2), (2, 3), (3, 4), (4, 4)]
 threedim_shapes = [(2, 2, 2), (3, 3, 2), (4, 4, 2), (5, 5, 2)]
+# Pairs where neither shape is elementwise no larger than the other.
+mixed_shape_pairs = [((6, 3), (2, 7)), ((2, 7), (6, 3)), ((5,), (9,)),
+                     ((4, 5, 2), (3, 2, 6)), ((8, 2), (3, 5))]
 stft_test_shapes = [
     # (input_shape, nperseg, noverlap, axis)
     ((50,), 17, 5, -1),
@@ -122,6 +125,132 @@ class LaxBackedScipySignalTests(jtu.JaxTestCase):
            np.complex64: 1e-2, np.complex128: 1e-6}
     self._CheckAgainstNumpy(osp_fun, jsp_fun, args_maker, check_dtypes=False,
                             tol=tol)
+    self._CompileAndCheck(jsp_fun, args_maker, tol=tol)
+
+  @jtu.sample_product(
+    shape=[(16,), (4, 16), (2, 3, 16)],
+    op=['welch', 'stft'],
+  )
+  def testSpectralCallableDetrend(self, shape, op):
+    def demean(d):
+      return d - d.mean(axis=-1, keepdims=True)
+    rng = jtu.rand_default(self.rng())
+    args_maker = lambda: [rng(shape, np.float64)]
+    kwds = dict(nperseg=4, noverlap=0, detrend=demean)
+    osp_fun = lambda x: getattr(osp_signal, op)(x, **kwds)[-1]
+    jsp_fun = lambda x: getattr(jsp_signal, op)(x, **kwds)[-1]
+    self._CheckAgainstNumpy(osp_fun, jsp_fun, args_maker, check_dtypes=False,
+                            tol={np.float32: 1e-5, np.float64: 1e-10,
+                                 np.complex64: 1e-5, np.complex128: 1e-10})
+
+  @jtu.sample_product(
+    [dict(shape=shape, axis=axis)
+     for shape in [(16,), (4, 16), (2, 3, 16)]
+     for axis in range(-len(shape), len(shape))
+     if shape[axis] >= 4],
+  )
+  def testStftCallableDetrendAxis(self, shape, axis):
+    # A callable detrend gets the segments transposed back to the caller's
+    # layout, so it must see the same thing scipy hands it.
+    def demean(d):
+      return d - d.mean(axis=-1, keepdims=True)
+    rng = jtu.rand_default(self.rng())
+    args_maker = lambda: [rng(shape, np.float64)]
+    kwds = dict(nperseg=4, noverlap=0, detrend=demean, axis=axis)
+    osp_fun = lambda x: osp_signal.stft(x, **kwds)[2]
+    jsp_fun = lambda x: jsp_signal.stft(x, **kwds)[2]
+    self._CheckAgainstNumpy(osp_fun, jsp_fun, args_maker, check_dtypes=False,
+                            tol={np.complex64: 1e-5, np.complex128: 1e-10})
+
+  def testCsdCallableDetrend(self):
+    def demean(d):
+      return d - d.mean(axis=-1, keepdims=True)
+    rng = jtu.rand_default(self.rng())
+    args_maker = lambda: [rng((16,), np.float64), rng((16,), np.float64)]
+    kwds = dict(nperseg=4, noverlap=0, detrend=demean)
+    osp_fun = lambda x, y: osp_signal.csd(x, y, **kwds)[1]
+    jsp_fun = lambda x, y: jsp_signal.csd(x, y, **kwds)[1]
+    self._CheckAgainstNumpy(osp_fun, jsp_fun, args_maker, check_dtypes=False,
+                            tol={np.complex64: 1e-5, np.complex128: 1e-10})
+
+  @jtu.sample_product(
+    [dict(xshape=xshape, yshape=yshape) for xshape, yshape in mixed_shape_pairs],
+    mode=['full', 'same'],
+    op=['convolve', 'correlate'],
+    dtype=[np.float32, np.float64],
+  )
+  def testConvolutionsMixedShapes(self, xshape, yshape, dtype, mode, op):
+    # Neither input contains the other, which only 'valid' mode requires.
+    jsp_op = getattr(jsp_signal, op)
+    osp_op = getattr(osp_signal, op)
+    rng = jtu.rand_default(self.rng())
+    args_maker = lambda: [rng(xshape, dtype), rng(yshape, dtype)]
+    osp_fun = partial(osp_op, mode=mode, method='direct')
+    jsp_fun = partial(jsp_op, mode=mode, method='direct',
+                      precision=lax.Precision.HIGHEST)
+    tol = {np.float32: 1e-2, np.float64: 1e-12}
+    self._CheckAgainstNumpy(osp_fun, jsp_fun, args_maker, check_dtypes=False, tol=tol)
+    self._CompileAndCheck(jsp_fun, args_maker, rtol=tol, atol=tol)
+
+  @jtu.sample_product(
+    [dict(xshape=xshape, yshape=yshape) for xshape, yshape in mixed_shape_pairs
+     if len(xshape) == 2],
+    mode=['full', 'same'],
+    op=['convolve2d', 'correlate2d'],
+    dtype=[np.float32, np.float64],
+  )
+  def testConvolutions2DMixedShapes(self, xshape, yshape, dtype, mode, op):
+    jsp_op = getattr(jsp_signal, op)
+    osp_op = getattr(osp_signal, op)
+    rng = jtu.rand_default(self.rng())
+    args_maker = lambda: [rng(xshape, dtype), rng(yshape, dtype)]
+    osp_fun = partial(osp_op, mode=mode)
+    jsp_fun = partial(jsp_op, mode=mode, precision=lax.Precision.HIGHEST)
+    tol = {np.float32: 1e-2, np.float64: 1e-12}
+    self._CheckAgainstNumpy(osp_fun, jsp_fun, args_maker, check_dtypes=False, tol=tol)
+    self._CompileAndCheck(jsp_fun, args_maker, rtol=tol, atol=tol)
+
+  @jtu.sample_product(
+    op=['convolve', 'correlate', 'convolve2d', 'correlate2d'],
+  )
+  def testConvolutionsMixedShapesValidError(self, op):
+    jsp_op = getattr(jsp_signal, op)
+    x = jnp.zeros((6, 3))
+    y = jnp.zeros((2, 7))
+    with self.assertRaisesRegex(ValueError, "at least as large"):
+      jsp_op(x, y, mode='valid')
+
+  @jtu.sample_product(
+    [dict(xshape=xshape, yshape=yshape)
+     for xshape, yshape in [((0,), (6,)), ((6,), (0,)), ((0, 3), (2, 3)),
+                            ((2, 0), (2, 3)), ((0, 0), (2, 3))]],
+    mode=['full', 'same', 'valid'],
+  )
+  def testFFTConvolutionEmpty(self, xshape, yshape, mode):
+    x = jnp.zeros(xshape)
+    y = jnp.zeros(yshape)
+    self.assertArraysEqual(jsp_signal.fftconvolve(x, y, mode=mode),
+                           osp_signal.fftconvolve(np.asarray(x), np.asarray(y),
+                                                  mode=mode),
+                           check_dtypes=False)
+
+  @jtu.sample_product(
+    [dict(xshape=xshape, yshape=yshape, axes=axes)
+     for xshape, yshape, axes in [((1, 9), (5, 4), 1),
+                                  ((5, 9), (1, 4), 1),
+                                  ((1, 4, 9), (3, 4, 4), 2),
+                                  ((3, 1, 9), (3, 5, 4), -1)]],
+    mode=['full', 'same', 'valid'],
+    dtype=[np.float32, np.float64],
+  )
+  def testFFTConvolutionBroadcastAxes(self, xshape, yshape, axes, mode, dtype):
+    # A size-1 mapped axis broadcasts, as it does in scipy.
+    rng = jtu.rand_default(self.rng())
+    args_maker = lambda: [rng(xshape, dtype), rng(yshape, dtype)]
+    osp_fun = partial(osp_signal.fftconvolve, mode=mode, axes=axes)
+    jsp_fun = partial(jsp_signal.fftconvolve, mode=mode, axes=axes)
+    tol = {np.float32: 1e-2, np.float64: 1e-6}
+    self._CheckAgainstNumpy(osp_fun, jsp_fun, args_maker, check_dtypes=False, tol=tol)
     self._CompileAndCheck(jsp_fun, args_maker, tol=tol)
 
   @jtu.sample_product(
