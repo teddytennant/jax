@@ -46,6 +46,16 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
     fabricating a phantom slice for fully-empty inputs.
 
 * Bug fixes
+  * The `dtype` argument to `jnp.<ufunc>.reduceat`, `jnp.maximum.reduce`,
+    `jnp.logaddexp.reduce`, `jnp.logaddexp2.reduce` and {func}`jax.numpy.var`
+    is now honored. Previously it was accepted and then dropped, so a narrow
+    input could overflow its own dtype instead of accumulating in the
+    requested one, and `jnp.maximum.reduce` raised a `TypeError`.
+  * `jax.Array.sum` now forwards its `initial` argument, as
+    {func}`jax.numpy.sum` and the other array reduction methods already did.
+  * {func}`jax.numpy.cumulative_prod` now promotes small integer inputs to the
+    default integer width, matching {func}`jax.numpy.cumulative_sum`, NumPy and
+    the array API.
   * Fixed a bug where {func}`jax.numpy.linalg.cond` returned NaN instead of
     infinity for singular matrices when `p` is `None` or `2`, matching NumPy
     and the other norms.

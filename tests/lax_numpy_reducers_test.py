@@ -284,6 +284,18 @@ class JaxNumpyReducerTests(jtu.JaxTestCase):
     self._CheckAgainstNumpy(np_fun, jnp_fun, args_maker, tol=tol)
     self._CompileAndCheck(jnp_fun, args_maker, rtol=tol, atol=tol)
 
+  @jtu.sample_product(
+    name=['sum', 'prod', 'max', 'min'],
+    initial=[0, 1, 5],
+  )
+  def testReducerInitialMethod(self, name, initial):
+    # The array methods must forward initial to the free function.
+    x = np.array([[3, 1, 2], [6, 5, 4]], dtype='int32')
+    self.assertArraysEqual(getattr(jnp.asarray(x), name)(initial=initial),
+                           getattr(np, name)(x, initial=initial))
+    self.assertArraysEqual(getattr(jnp.asarray(x), name)(axis=0, initial=initial),
+                           getattr(np, name)(x, axis=0, initial=initial))
+
   @jtu.sample_product(rec = JAX_REDUCER_INITIAL_RECORDS)
   def testReducerBadInitial(self, rec):
     jnp_op = getattr(jnp, rec.name)
@@ -727,6 +739,19 @@ class JaxNumpyReducerTests(jtu.JaxTestCase):
     self._CompileAndCheck(jnp_wrapper, args_maker, rtol=tol_spec, atol=tol_spec)
 
   @jtu.sample_product(
+    jnp_fn_name=["var", "nanvar"],
+    out_dtype=[np.int16, np.int32, np.float32],
+  )
+  def testVarIntegerDtype(self, jnp_fn_name, out_dtype):
+    # The dtype argument is the output dtype, including for integers.
+    jnp_fn = getattr(jnp, jnp_fn_name)
+    np_fn = getattr(np, jnp_fn_name)
+    x = np.array([1, 2, 3, 4, 5, 6], dtype='int32')
+    self.assertArraysEqual(jnp_fn(jnp.asarray(x), dtype=out_dtype),
+                           np_fn(x, dtype=out_dtype))
+
+
+  @jtu.sample_product(
     [dict(shape=shape, dtype=dtype, y_dtype=y_dtype, rowvar=rowvar,
           y_shape=y_shape)
       for shape in [(5,), (10, 5), (5, 10)]
@@ -962,6 +987,20 @@ class JaxNumpyReducerTests(jtu.JaxTestCase):
     jnp_fun = lambda x: jnp.cumulative_sum(x, **kwargs)
     self._CheckAgainstNumpy(np_fun, jnp_fun, args_maker,
                             rtol={jnp.bfloat16: 5e-2})
+    self._CompileAndCheck(jnp_fun, args_maker)
+
+  @jtu.sample_product(
+    dtype=[bool, np.int8, np.int16, np.uint8, np.uint16, np.int32],
+    include_initial=[False, True],
+  )
+  def testCumulativeProdPromotesIntegers(self, dtype, include_initial):
+    # With no explicit dtype, the accumulator is promoted as in numpy and in
+    # the array API, the same as cumulative_sum.
+    args_maker = lambda: [np.array([2, 3, 4], dtype=dtype)]
+    kwargs = dict(include_initial=include_initial)
+    np_fun = lambda x: np.cumulative_prod(x, **kwargs)
+    jnp_fun = lambda x: jnp.cumulative_prod(x, **kwargs)
+    self._CheckAgainstNumpy(np_fun, jnp_fun, args_maker)
     self._CompileAndCheck(jnp_fun, args_maker)
 
   @jtu.sample_product(

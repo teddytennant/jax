@@ -42,9 +42,6 @@ array_api_tests/test_operators_and_elementwise_functions.py::test_clip
 # JAX raises a ValueError rather than the expected IndexError for out-of-bound axis
 array_api_tests/test_manipulation_functions.py::TestExpandDims::test_expand_dims
 
-# Doesn't promote to uint64
-array_api_tests/test_statistical_functions.py::test_cumulative_prod
-
 # TODO(jakevdp): fix the following failures:
 
 # Returns NaN rather than inf

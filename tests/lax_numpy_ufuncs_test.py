@@ -283,6 +283,21 @@ class LaxNumpyUfuncTests(jtu.JaxTestCase):
     self._CompileAndCheck(jnp_fun_reduce, args_maker)
 
   @jtu.sample_product(
+      name=['add', 'multiply', 'maximum', 'minimum', 'logaddexp', 'logaddexp2'],
+  )
+  def test_binary_ufunc_reduce_dtype(self, name):
+    # dtype sets the accumulator and the output dtype.
+    x = jnp.arange(1, 5, dtype=jnp.float16)
+    jnp_result = getattr(jnp, name).reduce(x, dtype=jnp.float32)
+    np_result = getattr(np, name).reduce(np.asarray(x), dtype=np.float32)
+    self.assertEqual(jnp_result.dtype, jnp.float32)
+    self.assertAllClose(jnp_result, np_result, rtol=1e-6)
+
+  def test_logaddexp_reduce_integer_dtype(self):
+    with self.assertRaisesRegex(ValueError, "must be inexact"):
+      jnp.logaddexp.reduce(jnp.arange(4, dtype='float32'), dtype='int32')
+
+  @jtu.sample_product(
       SCALAR_FUNCS,
       [{'shape': shape, 'axis': axis}
        for shape in all_shapes
@@ -576,6 +591,19 @@ class LaxNumpyUfuncTests(jtu.JaxTestCase):
 
     self._CheckAgainstNumpy(jnp_fun_reduceat, np_fun_reduceat, args_maker, tol=tol)
     self._CompileAndCheck(jnp_fun_reduceat, args_maker)
+
+
+  @jtu.sample_product(
+      name=['add', 'multiply', 'maximum', 'minimum'],
+  )
+  def test_binary_ufunc_reduceat_dtype(self, name):
+    # dtype sets the accumulator, so a narrow input does not overflow.
+    x = np.full(8, 100, dtype='int8')
+    idx = np.array([0, 4])
+    jnp_result = getattr(jnp, name).reduceat(jnp.asarray(x), jnp.asarray(idx),
+                                             dtype='int32')
+    np_result = getattr(np, name).reduceat(x, idx, dtype='int32')
+    self.assertArraysEqual(jnp_result, np_result)
 
 
 if __name__ == "__main__":

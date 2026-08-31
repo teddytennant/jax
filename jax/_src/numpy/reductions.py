@@ -401,7 +401,7 @@ def prod(a: ArrayLike, axis: Axis = None, dtype: DTypeLike | None = None,
                       promote_integers=promote_integers)
 
 
-@api.jit(static_argnames=('axis', 'keepdims'), inline=True)
+@api.jit(static_argnames=('axis', 'keepdims', 'dtype'), inline=True)
 def _reduce_max(a: ArrayLike, axis: Axis = None, dtype: DTypeLike | None = None,
                 out: None = None, keepdims: bool = False,
                 initial: ArrayLike | None = None, where: ArrayLike | None = None) -> Array:
@@ -745,11 +745,12 @@ def _logsumexp(a: ArrayLike, axis: Axis = None, dtype: DTypeLike | None = None,
     raise NotImplementedError("The 'out' argument to jnp.logaddexp.reduce is not supported.")
   if dtype is not None:
     dtype = dtypes.check_and_canonicalize_user_dtype(dtype, "jnp.logaddexp.reduce")
-  # TODO(phawkins): dtype isn't used here. That seems like a bug!
-  del dtype
+    if not dtypes.issubdtype(dtype, np.inexact):
+      raise ValueError("dtype argument to jnp.logaddexp.reduce must be inexact; "
+                       f"got {dtype.name}")
   a = ensure_arraylike("logsumexp", a)
   where = check_where("logsumexp", where)
-  a_arr, = promote_dtypes_inexact(a)
+  a_arr, = promote_dtypes_inexact(a if dtype is None else lax.asarray(a).astype(dtype))
   pos_dims, dims = _reduction_dims(a_arr, axis)
   amax = max(a_arr.real, axis=dims, keepdims=keepdims, where=where, initial=-np.inf)
   amax = lax.stop_gradient(lax.select(lax.is_finite(amax), amax, lax.full_like(amax, 0)))
@@ -769,7 +770,14 @@ def _logsumexp2(a: ArrayLike, axis: Axis = None, dtype: DTypeLike | None = None,
   if dtype is not None:
     dtype = dtypes.check_and_canonicalize_user_dtype(
         dtype, "jnp.logaddexp2.reduce")
+    if not dtypes.issubdtype(dtype, np.inexact):
+      raise ValueError("dtype argument to jnp.logaddexp2.reduce must be "
+                       f"inexact; got {dtype.name}")
   a = ensure_arraylike("logsumexp2", a)
+  if dtype is not None:
+    # Scale in the requested dtype rather than the input's, or a narrow input
+    # rounds before the accumulation ever sees it.
+    a = lax.asarray(a).astype(dtype)
   where = check_where("logsumexp2", where)
   ln2 = float(np.log(2))
   if initial is not None:
@@ -1159,8 +1167,19 @@ def _var(a: Array, *, axis: Axis = None, dtype: DTypeLike | None = None,
   result = sum(centered, axis, dtype=computation_dtype, keepdims=keepdims, where=where)
   result = lax.div(result, normalizer).astype(dtype)
   with config.debug_nans(False):
-    result = _where(normalizer > 0, result, np.nan)
+    result = _where(normalizer > 0, result, _empty_variance_fill(dtype))
   return result
+
+
+def _empty_variance_fill(dtype: DTypeLike) -> np.ndarray:
+  """The value reported when a variance has nothing to average over.
+
+  NumPy warns and returns nan, or zero for an integral dtype, which cannot hold
+  nan. The value is built in the output dtype so that filling it in does not
+  promote the result away from what the caller asked for.
+  """
+  return np.array(np.nan if dtypes.issubdtype(dtype, np.inexact) else 0,
+                  dtype=dtype)
 
 
 def _var_promote_types(a_dtype: DTypeLike, dtype: DTypeLike | None) -> tuple[DType, DType]:
@@ -1940,7 +1959,7 @@ def _nanvar(a: Array, *, axis: Axis = None, dtype: DTypeLike | None = None, out:
   normalizer = normalizer - ddof
   normalizer_mask = lax.le(normalizer, lax._zero(normalizer))
   result = sum(centered, axis, keepdims=keepdims, where=where)
-  result = _where(normalizer_mask, np.nan, result)
+  result = _where(normalizer_mask, _empty_variance_fill(result.dtype), result)
   divisor = _where(normalizer_mask, 1, normalizer)
   result = lax.div(result, lax.convert_element_type(divisor, result.dtype))
   return lax.convert_element_type(result, dtype)
@@ -2261,6 +2280,14 @@ def _cumsum_with_promotion(a: ArrayLike, axis: int | None = None,
                                a, axis, dtype, out, promote_integers=True)
 
 
+@api.jit(static_argnames=('axis', 'dtype'))
+def _cumprod_with_promotion(a: ArrayLike, axis: int | None = None,
+           dtype: DTypeLike | None = None, out: None = None) -> Array:
+  """Utility function to compute cumprod with integer promotion."""
+  return _cumulative_reduction("_cumprod_with_promotion", control_flow.cumprod,
+                               a, axis, dtype, out, promote_integers=True)
+
+
 @export
 def cumulative_sum(
     x: ArrayLike, /, *, axis: int | None = None,
@@ -2375,7 +2402,7 @@ def cumulative_prod(
   axis = canonicalize_axis(axis, x.ndim)
   if dtype is not None:
     dtype = dtypes.check_and_canonicalize_user_dtype(dtype)
-  out = _cumulative_reduction("cumulative_prod", control_flow.cumprod, x, axis, dtype)
+  out = _cumprod_with_promotion(x, axis=axis, dtype=dtype)
   if include_initial:
     zeros_shape = list(x.shape)
     zeros_shape[axis] = 1
